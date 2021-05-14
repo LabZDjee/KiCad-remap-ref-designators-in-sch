@@ -12,11 +12,13 @@ namespace SwapRefsInSch
     {
         public MapValue(string reference)
         {
-            mapped = false;
+            mapped = new HashSet<int>();
+            numberOfParts = 1;
             this.reference = reference;
         }
-        public string reference; // value of the reference designator
-        public bool mapped; // true when already found
+        public string reference; // value of the new reference designator
+        public HashSet<int> mapped; // set containing parts identified
+        public int numberOfParts; // number of parts for this reference
     }
 
     // stores contents of a file in memory together with its name
@@ -45,10 +47,10 @@ namespace SwapRefsInSch
 
     class ArgOptions
     {
-        [Value(0, MetaName = "<KiCadProjectName>",HelpText ="KiCad project name to work on (without extension).", Required = true)]
+        [Value(0, MetaName = "<KiCadProjectName>", HelpText = "KiCad project name to work on (without extension).", Required = true)]
         public string KiCadProjectName { get; set; }
 
-        [Option('o', "overwrite", Default = (bool)false,HelpText = "silently overwrites .orgRefMap.sch backup files.", Required = false )]
+        [Option('o', "overwrite", Default = (bool)false, HelpText = "silently overwrites .orgRefMap.sch backup files.", Required = false)]
         public bool OverwriteBackup { get; set; }
 
         [Option('d', "dryrun", Default = (bool)false, HelpText = "dry run: only works in memory. Nothing written to disk.", Required = false)]
@@ -65,10 +67,13 @@ namespace SwapRefsInSch
         static Regex mapCompRx = new Regex(@"^\$Comp\s*$", RegexOptions.Compiled);
         static Regex mapEndCompRx = new Regex(@"^\$EndComp\s*$", RegexOptions.Compiled);
         static Regex mapLCompRx = new Regex(@"^L\s+(\S+)\s+(\S+)\s*$", RegexOptions.Compiled);
-        static Regex mapF0CompRx = new Regex(@"^F\s*0\s+""(\S+)""(.*)$", RegexOptions.Compiled); // first should be \s+ but it was decided to widden to \s*, just in case
+        static Regex mapUCompRx = new Regex(@"^U\s+(\d+)\s+\S+\s+([0-9A-F]+)\s*$", RegexOptions.Compiled);
+        static Regex mapARCompRx = new Regex(@"^AR\s+Path\s*=\s*""(\S+)""\s+Ref\s*=\s*""(\S+)""(.*)$", RegexOptions.Compiled);
+        static Regex mapF0CompRx = new Regex(@"^F\s*0\s+""(\S+)""(.*)$", RegexOptions.Compiled); // first should be \s+ but it was decided to widen to \s*, just in case
 
         static List<InMemoryFile> inMemSchBakFiles = new List<InMemoryFile>(); // backup of schematic files
         static List<InMemoryFile> inMemSchFiles = new List<InMemoryFile>(); // schematic files to be altered
+        static Dictionary<string, InMemoryFile> sheetPaths = new Dictionary<string, InMemoryFile>(); // paths to schematics files
 
         static ArgOptions argOptions = null; // command line options
 
@@ -77,7 +82,7 @@ namespace SwapRefsInSch
             string applicationName = AppDomain.CurrentDomain.FriendlyName;
             var parser = new CommandLine.Parser(with => with.HelpWriter = null);
             var parserResult = parser.ParseArguments<ArgOptions>(args);
-            if(parserResult.Tag == ParserResultType.NotParsed)
+            if (parserResult.Tag == ParserResultType.NotParsed)
             {
                 string helpText = HelpText.AutoBuild(parserResult, h =>
                 {
@@ -112,7 +117,7 @@ namespace SwapRefsInSch
             }
             try
             {
-                ExtractSheets(schFilename, inMemSchFiles);
+                ExtractSheets(schFilename, "", inMemSchFiles, sheetPaths);
             }
             catch (Exception e)
             {
@@ -121,13 +126,13 @@ namespace SwapRefsInSch
             }
             if (argOptions.Verbose)
             {
-                if(inMemSchFiles.Count < 2)
+                if (inMemSchFiles.Count < 2)
                 {
                     Console.WriteLine($"Simple schematics file (no hierarchy detected): {inMemSchFiles[0].fileName}");
                 }
                 else
                 {
-                    Console.WriteLine($"{inMemSchFiles.Count} schematics files found in hierarchy:");
+                    Console.WriteLine($"{inMemSchFiles.Count} schematic files found in project:");
                     foreach (InMemoryFile f in inMemSchFiles)
                     {
                         Console.WriteLine($" {f.fileName}");
@@ -138,7 +143,7 @@ namespace SwapRefsInSch
             foreach (InMemoryFile f in inMemSchFiles)
             {
                 Match match = extractSchRx.Match(f.fileName);
-                if(match.Success == false)
+                if (match.Success == false)
                 {
                     throw new Exception($"Panic: unexpected failure trying to extract .sch from file name '{f.fileName}'");
                 }
@@ -152,17 +157,17 @@ namespace SwapRefsInSch
             }
             if (!File.Exists(mapFilename))
             {
-               Console.WriteLine($"Cannot proceed: {mapFilename} not found!");
-               Exit(-5);
+                Console.WriteLine($"Cannot proceed: {mapFilename} not found!");
+                Exit(-5);
             }
             string[] lines = File.ReadAllLines(mapFilename);
             Dictionary<string, MapValue> map = new Dictionary<string, MapValue>(); // associative array: key is old reference designator, value contains new
             Regex mapEltRx = new Regex(@"(\S+)\s+(\S+)", RegexOptions.Compiled);
             // checks if reference designators are unique, done separately in both lists
-            for (int i=0; i<lines.Length; i++)
+            for (int i = 0; i < lines.Length; i++)
             {
-              Match match = mapEltRx.Match(lines[i]);
-              if(match.Success == true)
+                Match match = mapEltRx.Match(lines[i]);
+                if (match.Success == true)
                 {
                     string left = match.Groups[1].Value;
                     string right = match.Groups[2].Value;
@@ -170,15 +175,15 @@ namespace SwapRefsInSch
                     {
                         if (k == left)
                         {
-                            Console.WriteLine($"Error: reference designator \"{left}\" reassigned on line {i + 1} duplicated!");
+                            Console.WriteLine($"Duplication error in \"{mapFilename}\": reference designator \"{left}\" reassigned on line {i + 1}!");
                             Exit(-6);
                         }
                     }
                     foreach (MapValue v in map.Values)
                     {
-                        if(v.reference==right)
+                        if (v.reference == right)
                         {
-                            Console.WriteLine($"Error: replacement reference designator \"{right}\" on line {i + 1} already listed!");
+                            Console.WriteLine($"Duplication error in \"{mapFilename}\": replacement reference designator \"{right}\" on line {i + 1} already listed!");
                             Exit(-7);
                         }
                     }
@@ -189,8 +194,8 @@ namespace SwapRefsInSch
             {
                 Console.WriteLine("Mapping file checked okay to proceed (no duplicate in old and new list of reference designators)");
             }
-            var refNotUnique = checkUniquenessOfReferences();
-            if(string.IsNullOrEmpty(refNotUnique) == false)
+            var refNotUnique = CheckUniquenessOfReferences(map);
+            if (string.IsNullOrEmpty(refNotUnique) == false)
             {
                 Console.WriteLine($"Will not proceed: reference designator \"{refNotUnique}\" in schematics is not unique!");
                 Exit(-8);
@@ -200,23 +205,37 @@ namespace SwapRefsInSch
                 Console.WriteLine("Before proceeding, checked uniqueness of reference designators in schematics: okay");
             }
             // now proceed to the real stuff in memory
-            foreach (string oldRef in map.Keys)
+            for (int fileIndex = 0; fileIndex < inMemSchFiles.Count; fileIndex++)
             {
-                for (int fileIndex=0; fileIndex< inMemSchFiles.Count; fileIndex++)
+                bool inComp = false;
+                int hitF = 0, hitL = 0, partNumber = 0;
+                string timestamp = "", oldRef = "";
+                for (int lineIndex = 0; lineIndex < inMemSchFiles[fileIndex].contents.Length; lineIndex++)
                 {
-                    bool inComp = false, hitF = false, hitL = false;
-                    for (int lineIndex = 0; lineIndex < inMemSchFiles[fileIndex].contents.Length; lineIndex++)
+                    string line = inMemSchBakFiles[fileIndex].contents[lineIndex];
+                    if (mapCompRx.IsMatch(line))
                     {
-                        string line = inMemSchBakFiles[fileIndex].contents[lineIndex];
-                        if (mapCompRx.IsMatch(line))
+                        inComp = true;
+                        hitF = 0;
+                        hitL = 0;
+                    }
+                    if (mapEndCompRx.IsMatch(line))
+                    {
+                        inComp = false;
+                        if (hitL > 0)
                         {
-                            inComp = true;
-                            hitF = false;
-                        }
-                        if (mapEndCompRx.IsMatch(line))
-                        {
-                            inComp = false;
-                            if(hitF && !hitL)
+                            if (hitF > 0)
+                            {
+                                if (map[oldRef].mapped.Add(partNumber) == false)
+                                {
+                                    throw new Exception($"Panic (should never happen)!\n Unexpected part number duplicate {partNumber} for old ref. designator {oldRef}");
+                                }
+                                if (argOptions.Verbose)
+                                {
+                                    Console.WriteLine($"Ref. designator \"{oldRef}\" replaced with \"{map[oldRef].reference}\" in L/F0, lines {hitL}/{hitF} of \"{inMemSchFiles[fileIndex].fileName}\"");
+                                }
+                            }
+                            else
                             {
                                 Console.WriteLine($"Inconsistency in schematics, cannot proceed:");
                                 Console.WriteLine($" reference designator '{oldRef}' just before line {lineIndex + 1} in file {inMemSchFiles[fileIndex].fileName}");
@@ -224,54 +243,94 @@ namespace SwapRefsInSch
                                 Exit(-9);
                             }
                         }
-                        if (inComp)
+                    }
+                    if (inComp)
+                    {
+                        Match match = mapUCompRx.Match(line);
+                        if (match.Success == true)
                         {
-                            Match match = mapLCompRx.Match(line);
-                            if(match.Success == true && match.Groups[2].Value == oldRef)
+                            timestamp = match.Groups[2].Value;
+                            if (int.TryParse(match.Groups[1].Value, out partNumber) == false)
                             {
-                                if(map[oldRef].mapped == true)
-                                {
-                                    Console.WriteLine($"Inconsistency in schematics, cannot proceed:");
-                                    Console.WriteLine($" reference designator '{oldRef}' at line {lineIndex+1} in file {inMemSchFiles[fileIndex].fileName} already met previously");
-                                    Exit(-10);
-                                }
-                                inMemSchFiles[fileIndex].contents[lineIndex] = $"L {match.Groups[1].Value} {map[oldRef].reference}";
-                                inMemSchFiles[fileIndex].dirty = true;
-                                hitF = true;
-                                MapValue mapVal = map[oldRef];
-                                mapVal.mapped = true;
+                                throw new Exception($"Panic (should never happen)!\n When parsing partNumber line {line + 1}, file {inMemSchFiles[fileIndex].fileName}");
                             }
-                            if(hitF)
+                        }
+                        else
+                        {
+                            match = mapLCompRx.Match(line);
+                            if (match.Success == true)
                             {
-                               match = mapF0CompRx.Match(line);
-                               if(match.Success == true && match.Groups[1].Value == oldRef)
+                                oldRef = match.Groups[2].Value;
+                                if (map.ContainsKey(oldRef))
                                 {
-                                    hitL = true;
-                                    inMemSchFiles[fileIndex].contents[lineIndex] = $"F 0 \"{map[oldRef].reference}\"{match.Groups[2].Value}";
-                                    if (argOptions.Verbose)
+                                    inMemSchFiles[fileIndex].contents[lineIndex] = $"L {match.Groups[1].Value} {map[oldRef].reference}";
+                                    inMemSchFiles[fileIndex].dirty = true;
+                                    hitL = lineIndex + 1;
+                                }
+                            }
+                            else
+                            {
+                                match = mapF0CompRx.Match(line);
+                                if (match.Success == true)
+                                {
+                                    if (hitL > 0 && oldRef != match.Groups[1].Value)
                                     {
-                                        Console.WriteLine($" - Replaced {oldRef} with {map[oldRef].reference} in {inMemSchFiles[fileIndex].fileName}");
+                                        Console.WriteLine($"Inconsistency in values of L reference \"{oldRef}\" and F 0 reference \"{match.Groups[1].Value}\"");
+                                        Exit(-10);
+                                    }
+                                    if (map.ContainsKey(oldRef))
+                                    {
+                                        inMemSchFiles[fileIndex].contents[lineIndex] = $"F 0 \"{map[oldRef].reference}\"{match.Groups[2].Value}";
+                                        inMemSchFiles[fileIndex].dirty = true;
+                                        hitF = lineIndex + 1;
+                                    }
+                                }
+                                else
+                                {
+                                    match = mapARCompRx.Match(line);
+                                    if (match.Success == true)
+                                    {
+                                        hitL = hitF = 0;
+                                        string path = match.Groups[1].Value;
+                                        oldRef = match.Groups[2].Value;
+                                        if (map.ContainsKey(oldRef))
+                                        {
+                                            string newRef = map[oldRef].reference;
+                                            inMemSchFiles[fileIndex].contents[lineIndex] = $"AR Path=\"{path}\" Ref=\"{newRef}\"{match.Groups[3].Value}";
+                                            if (FindSheetFromArPath(path, timestamp) == inMemSchFiles[fileIndex])
+                                            {
+                                                if (map[oldRef].mapped.Add(partNumber) == false)
+                                                {
+                                                    throw new Exception($"Panic (should never happen)!\n Unexpected part number duplicate {partNumber} for old ref. designator {oldRef}");
+                                                }
+                                                if (argOptions.Verbose)
+                                                {
+                                                    Console.WriteLine($"Ref. designator \"{oldRef}\" replaced with \"{newRef}\" in AR, line {lineIndex + 1} of file \"{inMemSchFiles[fileIndex].fileName}\"");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-
                     }
                 }
             }
             // job completed in memory, now check every substitution was properly ticked as done
-            foreach(string oldRef in map.Keys)
+            foreach (string oldRef in map.Keys)
             {
-                if(map[oldRef].mapped == false)
+                if (CheckConsistencyOfParts(map[oldRef].mapped, map[oldRef].numberOfParts) == false)
                 {
                     Console.WriteLine($"Cannot proceed: reference designator '{map[oldRef].reference}' (expected to change from '{oldRef}') not found in schematics");
                     Exit(-11);
                 }
             }
-            refNotUnique = checkUniquenessOfReferences();
+            refNotUnique = CheckUniquenessOfReferences(null);
             if (string.IsNullOrEmpty(refNotUnique) == false)
             {
-                Console.WriteLine($"Failure after having made replacements \"{refNotUnique}\" in schematics is not unique!");
+                Console.WriteLine($"Failure after having made replacements: \"{refNotUnique}\" in schematics is not unique!");
+                Console.WriteLine($"Probable cause: \"{refNotUnique}\" is defined outside of the list of reference designators to replace");
+                Console.WriteLine("This list should be carefully checked");
                 Exit(-12);
             }
             if (argOptions.Verbose)
@@ -302,71 +361,179 @@ namespace SwapRefsInSch
             Exit(0);
         }
 
-        // return first duplicate met if any or null
-        static string checkUniquenessOfReferences()
+        // given a set containing which parts of a reference designator are defined, checks they
+        // contains a contiguous number of values from 1 to partSetCount
+        // if partSetCount is negative, it is redefined as number of elements of set
+        static bool CheckConsistencyOfParts(HashSet<int> partSet, int partSetCount = -1)
         {
-            Dictionary<string, bool> existingReferences = new Dictionary<string, bool>();
-            foreach(InMemoryFile f in inMemSchFiles)
+            if (partSetCount < 0)
+            {
+                partSetCount = partSet.Count;
+            }
+            if (partSetCount != partSet.Count)
+            {
+                return false;
+            }
+            for (int i = 1; i <= partSetCount; i++)
+            {
+                if (partSet.Contains(i) == false)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // return first duplicated reference designator met if any or null
+        // map: if not null and if result is successful, adjusts numberOfParts in this dictionary
+        static string CheckUniquenessOfReferences(Dictionary<string, MapValue> map)
+        {
+            Dictionary<string, HashSet<int>> existingReferences = new Dictionary<string, HashSet<int>>();
+            foreach (InMemoryFile f in inMemSchFiles)
             {
                 bool insideComp = false;
-                foreach(string line in f.contents)
+                bool foundArFields = false;
+                string refDesignator = "";
+                string timeStamp = "";
+                int partNumber = 1;
+                foreach (string line in f.contents)
                 {
-                    if(mapCompRx.Match(line).Success == true)
+                    if (mapCompRx.Match(line).Success == true)
                     {
                         insideComp = true;
-                    } else if(mapEndCompRx.Match(line).Success == true)
+                        foundArFields = false;
+                    }
+                    else if (mapEndCompRx.Match(line).Success == true)
                     {
                         insideComp = false;
-                    } else if (insideComp)
+                    }
+                    else if (insideComp)
                     {
-                        Match match = mapLCompRx.Match(line);
-                        if(match.Success == true)
+                        Match match = mapUCompRx.Match(line);
+                        if (match.Success == true)
                         {
-                            string referenceDesignator = match.Groups[2].Value;
-                            if (existingReferences.ContainsKey(referenceDesignator))
+                            timeStamp = match.Groups[2].Value;
+                            if (int.TryParse(match.Groups[1].Value, out partNumber) == false)
                             {
-                                return referenceDesignator;
+                                throw new Exception($"Panic (unexpected) in CheckUniquenessOfReferences parsing partNumber (line {line + 1}, file {f.fileName})");
                             }
-                            existingReferences.Add(referenceDesignator, true);
                         }
+                        else
+                        {
+                            refDesignator = "";
+                            match = mapARCompRx.Match(line);
+                            if (match.Success == true)
+                            {
+                                foundArFields = true;
+                                if (FindSheetFromArPath(match.Groups[1].Value, timeStamp) == f)
+                                {
+                                    refDesignator = match.Groups[2].Value;
+                                }
+                            }
+                            else if (foundArFields == false)
+                            {
+                                match = mapF0CompRx.Match(line);
+                                if (match.Success == true)
+                                {
+                                    refDesignator = match.Groups[1].Value;
+                                }
+                            }
+                            if (refDesignator.Length > 0)
+                            {
+                                if (existingReferences.ContainsKey(refDesignator))
+                                {
+                                    if (existingReferences[refDesignator].Add(partNumber) == false)
+                                    {
+                                        return refDesignator;
+                                    }
+                                }
+                                else
+                                {
+                                    HashSet<int> partSet = new HashSet<int>();
+                                    partSet.Add(partNumber);
+                                    existingReferences.Add(refDesignator, partSet);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            foreach (string refDesignator in existingReferences.Keys)
+            {
+                if (CheckConsistencyOfParts(existingReferences[refDesignator]) == false)
+                {
+                    return refDesignator;
+                }
+            }
+            if (map != null)
+            {
+                foreach (string refDesignator in existingReferences.Keys)
+                {
+                    if (map.ContainsKey(refDesignator))
+                    {
+                        map[refDesignator].numberOfParts = existingReferences[refDesignator].Count;
                     }
                 }
             }
             return null;
         }
+
         // recursive function which given a schematics filename 'schFilename' adds its filename and contents to 'memFiles' list
         //  and also looks for hierarchical sheets at any level to add them as well to the 'memFiles' list
-        static void ExtractSheets(string schFilename, List<InMemoryFile> memFiles)
+        static void ExtractSheets(string schFilename, string path, List<InMemoryFile> memFiles, Dictionary<string, InMemoryFile> sheetPaths)
         {
-            if(memFiles.Exists(f => f.fileName == schFilename))
+            if (memFiles.Exists(f => f.fileName == schFilename)) // should never happen the way we analyze multiple-page schematic files
             {
                 throw new Exception($"Circular reference (or redundant reference) to sheet {schFilename}");
             }
             InMemoryFile memFile = new InMemoryFile(schFilename);
             memFiles.Add(memFile);
+            sheetPaths.Add(path, memFile);
             bool inDeepSheet = false;
+            string timeStamp = "";
             Regex inSheetRx = new Regex(@"^\$Sheet\s*$", RegexOptions.Compiled);
             Regex outOfSheetRx = new Regex(@"^\$EndSheet\s*$", RegexOptions.Compiled);
+            Regex timeStampRx = new Regex(@"^U\s+([0-9A-F]+).*$", RegexOptions.Compiled);
             Regex sheetFilenameRx = new Regex(@"^F1\s+""(\S+)""", RegexOptions.Compiled);
-            for (int i = 0; i< memFile.contents.Length; i++)
+            for (int i = 0; i < memFile.contents.Length; i++)
             {
-                if(!inDeepSheet)
+                if (!inDeepSheet)
                 {
                     if (inSheetRx.IsMatch(memFile.contents[i]))
                     {
                         inDeepSheet = true;
                     }
-                } else
+                }
+                else
                 {
                     if (outOfSheetRx.IsMatch(memFile.contents[i]))
                     {
                         inDeepSheet = false;
-                    } else
+                    }
+                    else
                     {
-                        Match match = sheetFilenameRx.Match(memFile.contents[i]);
-                        if(match.Success == true)
+                        Match match = timeStampRx.Match(memFile.contents[i]);
+                        if (match.Success == true)
                         {
-                            ExtractSheets(match.Groups[1].Value, memFiles);
+                            timeStamp = match.Groups[1].Value;
+                        }
+                        else
+                        {
+                            match = sheetFilenameRx.Match(memFile.contents[i]);
+                            if (match.Success == true)
+                            {
+                                string newPath = $"{path}/{timeStamp}";
+                                string newSheetFilename = match.Groups[1].Value;
+                                Int32 index = memFiles.FindIndex(f => f.fileName == newSheetFilename);
+                                if (index >= 0)
+                                {
+                                    sheetPaths.Add(newPath, memFiles[index]);
+                                }
+                                else
+                                {
+                                    ExtractSheets(newSheetFilename, newPath, memFiles, sheetPaths);
+                                }
+                            }
                         }
                     }
 
@@ -374,11 +541,27 @@ namespace SwapRefsInSch
             }
         }
 
+        // given a full AR path field and a $Comp timestamp (in filed U), return 
+        // corresponding InMemoryFile for that sheet or null if path does not designate a sheet
+        static InMemoryFile FindSheetFromArPath(string path, string compTimestamp)
+        {
+            int index = path.IndexOf(compTimestamp);
+            if (index >= 0)
+            {
+                string sheetPath = index > 0 ? path.Remove(index - 1) : "";
+                if (sheetPaths.ContainsKey(sheetPath))
+                {
+                    return sheetPaths[sheetPath];
+                }
+            }
+            return null;
+        }
+
         static void Exit(int code)
         {
-            if(argOptions != null)
+            if (argOptions != null)
             {
-                if (argOptions.Dryrun == true)
+                if (argOptions.Dryrun == true && code > -1)
                 {
                     Console.WriteLine("Only a dry-run: no file was created or altered in any way");
                 }
