@@ -349,7 +349,7 @@ namespace SwapRefsInSch
                         inMemSchBakFiles[indexFile].WriteBack();
                         if (argOptions.Verbose)
                         {
-                            Console.WriteLine($"Files ${inMemSchFiles[indexFile].fileName} and ${inMemSchBakFiles[indexFile].fileName} written to disk");
+                            Console.WriteLine($"Files {inMemSchFiles[indexFile].fileName} and {inMemSchBakFiles[indexFile].fileName} written to disk");
                         }
                     }
                 }
